@@ -2,48 +2,49 @@ use chrono::prelude::*;
 //use env_logger;
 //use log::{debug, error, info};
 use log;
-use slog::{slog_o, Duplicate};
-use slog_term;
+use slog::{slog_o};
 use slog_async;
 use slog_stdlog;
-use slog_scope::{info,error, warn, debug};
+use slog_scope::{info, error, warn, debug};
 use slog::Drain;
 use slog_journald;
-use slog_envlogger;
 
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
-use ws::{connect, CloseCode, Error, Handler, Handshake, Message, Result, Sender};
+use ws::{CloseCode, Error, Handler, Handshake, Message, Result, Sender, WebSocket};
+use std::cell::RefCell;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct TraidingPairs {
     url_symbol: String,
 }
 
-#[derive(Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 struct Symbol(String);
 
-struct Client<'a> {
-    out: Sender,
-    symbols: &'a [Symbol],
-    fs_ts: Option<String>,
-    file: Option<File>,
+struct FileWrite {
+    fs_ts: RefCell<Option<String>>,
+    file: RefCell<Option<File>>,
 }
 
-impl Client<'_> {
-    fn new(out: Sender, symbols: &[Symbol]) -> Client {
-        Client {
-            out,
-            symbols,
-            fs_ts: None,
-            file: None,
+struct Client<'a, 'b> {
+    out: Sender,
+    symbols: &'a [Symbol],
+    file_write: &'b FileWrite,
+
+}
+
+impl FileWrite {
+    fn new() -> FileWrite {
+        FileWrite {
+            fs_ts: RefCell::new(None),
+            file: RefCell::new(None),
         }
     }
-
     fn build_file_name(ts: &str) -> String {
-        let n = format!("data/bitstamp2-ws-{}.log", ts);
+        let n = format!("data/bitfinex-ws-{}.log", ts);
         info!("{}", n);
         n
     }
@@ -55,40 +56,37 @@ impl Client<'_> {
             .open(path)
             .unwrap()
     }
-
-    fn write(&mut self, buf: &[u8]) -> std::result::Result<usize, std::io::Error> {
+    fn write(&self, buf: &[u8]) -> std::result::Result<usize, std::io::Error> {
         let utc: DateTime<Utc> = Utc::now();
         let fs_ts = utc.format("%Y-%m-%d_%HZ").to_string();
+        let gleich = self.fs_ts.borrow().as_ref().filter(|x| x == &&fs_ts).is_some();
+        if !gleich {
+            debug!("timestamp: {}", fs_ts);
+            self.file.borrow_mut().as_mut().map(|x| {
+                x.flush().unwrap();
+                x
+            }).map(|x| {
+                x.sync_all().unwrap();
+                x
+            });
 
-        match self.fs_ts.as_ref() {
-            Some(x) => {
-                if x == &fs_ts {
-                    //self.file.as_mut().unwrap().write(buf)
-                } else {
-                    debug!("timestamp: {}", fs_ts);
-                    let f = self.file.as_mut().unwrap();
-
-                    f.flush().unwrap();
-                    f.sync_all().unwrap();
-
-                    self.fs_ts = Some(fs_ts);
-                    self.file = Some(Client::create_file(&Client::build_file_name(
-                        &self.fs_ts.as_ref().unwrap(),
-                    )));
-                    //self.file.as_mut().unwrap().write(buf)
-                }
-            }
-            None => {
-                debug!("timestamp: {}", fs_ts);
-
-                self.fs_ts = Some(fs_ts);
-                self.file = Some(Client::create_file(&Client::build_file_name(
-                    &self.fs_ts.as_ref().unwrap(),
-                )));
-                //self.file.as_mut().unwrap().write(buf)
-            }
+            self.fs_ts.replace(Some(fs_ts));
+            self.file.replace(Some(FileWrite::create_file(&FileWrite::build_file_name(
+                &self.fs_ts.borrow().as_ref().unwrap()),
+            )));
         };
-        self.file.as_mut().unwrap().write(buf)
+
+        self.file.borrow_mut().as_mut().unwrap().write(buf)
+    }
+}
+
+impl<'a, 'b> Client<'a, 'b> {
+    fn new(out: Sender, symbols: &'a [Symbol], fw: &'b FileWrite) -> Client<'a, 'b> {
+        Client {
+            out,
+            symbols,
+            file_write: fw,
+        }
     }
 }
 
@@ -103,32 +101,27 @@ struct SubscribeMessage {
     data: SubscribeMessageData,
 }
 
-const ALL_SUBSCRIPTION_TOPICS: [&str; 5] = [
-    "live_trades",
-    "live_orders",
-    "order_book",
-    "detail_order_book",
-    "diff_order_book",
-];
 
-impl Handler for Client<'_> {
+const CONF: & str = "{\"event\": \"conf\", \"flags\": 196608}";
+
+static URL: & str = "wss://api-pub.bitfinex.com/ws/2";
+
+impl<'a, 'b> Handler for Client<'a, 'b> {
     fn on_open(&mut self, shake: Handshake) -> Result<()> {
         if let Some(addr) = shake.remote_addr()? {
             info!("Connection with {} now open", addr);
         }
-        for topic in ALL_SUBSCRIPTION_TOPICS.iter() {
-            for symbol in self.symbols.iter() {
-                let m = SubscribeMessage {
-                    event: "bts:subscribe".to_owned(),
-                    data: SubscribeMessageData {
-                        channel: format!("{}_{}", topic, symbol.0),
-                    },
-                };
-
-                let j = serde_json::to_string(&m).unwrap();
-                self.out.send(Message::Text(j)).unwrap();
-            }
+        self.out.send(CONF).unwrap();
+        for symbol in self.symbols.iter() {
+            let trade = format!("{{\"event\": \"subscribe\", \"channel\": \"trades\", \"symbol\": \"{}\"}}", symbol.0);
+            let book = format!("{{\"event\": \"subscribe\", \"channel\": \"book\", \"prec\": \"R0\", \"symbol\": \"{}\", \"len\": 100 }}", symbol.0);
+            //info!("send trade {} {}", count, trade);
+            self.out.send(trade)?;
+            //info!("send trade book {}", book);
+            self.out.send(book)?;
+            //info!("gesendet {}", count);
         }
+
         info!("subscribed");
         Ok(())
     }
@@ -142,7 +135,7 @@ impl Handler for Client<'_> {
             mm.push_str(", ");
             mm.push_str(&s);
             mm.push_str("\n");
-            self.write(mm.as_bytes()).unwrap();
+            self.file_write.write(mm.as_bytes()).unwrap();
         } else {
             error!("{:?}", msg);
         }
@@ -150,6 +143,7 @@ impl Handler for Client<'_> {
     }
     fn on_close(&mut self, code: CloseCode, reason: &str) {
         info!("Connection closing due to ({:?}) {}", code, reason);
+        self.out.connect( url::Url::parse(URL).unwrap()).unwrap();
     }
     fn on_error(&mut self, err: Error) {
         error!("{:?}", err);
@@ -159,10 +153,11 @@ impl Handler for Client<'_> {
 fn setup_logging() -> slog_scope::GlobalLoggerGuard {
     //let decorator = slog_term::TermDecorator::new().build();
     //let drain_term = slog_async::Async::new(slog_term::FullFormat::new(decorator).build().fuse()).build().fuse();
-    let drain = slog_async::Async::new(slog_journald::JournaldDrain.fuse()).build().fuse();
-    //let drain = Duplicate::new(drain_term, drain).fuse();
-   // let drain = slog_envlogger::new( drain).fuse();
+    let drain = slog_journald::JournaldDrain.fuse();
     let drain = slog_async::Async::new(drain).build().fuse();
+    //let drain = Duplicate::new(drain_term, drain).fuse();
+    // let drain = slog_envlogger::new( drain).fuse();
+    //let drain = slog_async::Async::new(drain).build().fuse();
     let logger = slog::Logger::root(drain, slog_o!("version" => env!("CARGO_PKG_VERSION")));
     let _scope_guard = slog_scope::set_global_logger(logger);
     let _log_guard = slog_stdlog::init_with_level(log::Level::Info).unwrap();
@@ -171,16 +166,26 @@ fn setup_logging() -> slog_scope::GlobalLoggerGuard {
 
 fn main() {
     let _logging_guard = setup_logging();
-    let resp = ureq::get("https://www.bitstamp.net/api/v2/trading-pairs-info/").call();
+    let resp = ureq::get("https://api.bitfinex.com/v1/symbols").call();
 
     // .ok() tells if response is 200-299.
     if resp.ok() {
-        let j: Vec<TraidingPairs> = serde_json::from_reader(resp.into_reader()).unwrap();
+        let j: Vec<Symbol> = serde_json::from_reader(resp.into_reader()).unwrap();
+        let mut c = j.chunks(15);
+        let count = c.len();
+        //let cc = c.next();
+        //let jj: Vec<Symbol> = j.into_iter().filter(|x| x.0.contains("btc")).collect();
         //println!("{:?}",j);
-        let jj: Vec<Symbol> = j.into_iter().map(|x| Symbol(x.url_symbol)).collect();
-        info!("{}", "INFO"; "APP" => "BITSTAMP2");
-        debug!("{:?}", jj);
-        connect("wss://ws.bitstamp.net/", |out| Client::new(out, &jj)).unwrap();
+        //let jj: Vec<Symbol> = j.into_iter().map(|x| Symbol(x.url_symbol)).collect();
+        info!("{}", "INFO"; "APP" => "BITFINEX");
+        //debug!("{:?}", jj);
+        let f = FileWrite::new();
+        let mut ws = WebSocket::new(|out| Client::new(out, c.next().unwrap(), &f)).unwrap();
+        for _i in  0..count {
+            ws.connect( url::Url::parse(URL).unwrap()).unwrap();
+        };
+        ws.run().unwrap();
+        //connect("wss://api-pub.bitfinex.com/ws/2", ).unwrap();
         std::process::exit(1);
     }
 }
